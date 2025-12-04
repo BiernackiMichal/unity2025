@@ -3,77 +3,134 @@ using UnityEngine.InputSystem;
 
 public class BuildingPlacer : MonoBehaviour
 {
-    [HideInInspector] public Tile[,] tileGrid;
+    [Header("Grid")]
+    public Tile[,] tileGrid;
+
+    [Header("Input / Raycast")]
     public LayerMask tileLayer;
+
+    [Header("Resources")]
     public ResourceManager resourceManager;
 
-    private GameObject blueprintRoot;
-    private GameObject blueprintModel;
-    private GameObject buildingPrefab;
-    private Vector2Int buildingSize;
-    private int costGold, costWood, costStone;
+    [Header("State (debug)")]
+    public bool isPlacing = false;
 
     private Camera cam;
-    private bool isPlacing = false;
+
+    // blueprint
+    public GameObject currentBlueprintPrefab;  // ← TileHighlighter to potrzebuje
+    private GameObject blueprintRoot;
+    private GameObject blueprintModel;
     private Renderer[] blueprintRenderers;
     private MaterialPropertyBlock mpb;
 
+    // building data
+    private GameObject buildingPrefab;
+    public Vector2Int blueprintSize;           // ← TileHighlighter to potrzebuje
+    private int costGold, costWood, costStone;
+
+    // placing fields
+    private Farm currentFarm;
+
+    // pulse
     private float pulseSpeed = 3f;
     private float pulseAmount = 0.1f;
 
+
     public bool IsPlacing => isPlacing;
-    public Tile[,] TileGrid => tileGrid;
 
     private void Start()
     {
         cam = Camera.main;
     }
 
-    public void StartPlacing(BuildingData building)
+    // ----------------------------------------------------------
+    // START PLACING BUILDINGS
+    // ----------------------------------------------------------
+
+    public void StartPlacing(BuildingData data)
     {
-        if (tileGrid == null || building.prefab == null) return;
+        if (tileGrid == null || data.prefab == null) return;
 
         ClearBlueprint();
 
-        buildingPrefab = building.prefab;
-        buildingSize = building.size;
-        costGold = building.gold;
-        costWood = building.wood;
-        costStone = building.stone;
+        buildingPrefab = data.prefab;
+        currentBlueprintPrefab = data.prefab;
+        blueprintSize = data.size;
 
+        costGold = data.gold;
+        costWood = data.wood;
+        costStone = data.stone;
+
+        currentFarm = null;
+
+        CreateBlueprint(currentBlueprintPrefab);
+        isPlacing = true;
+    }
+
+    public void StartPlacingField(Farm farm)
+    {
+        if (tileGrid == null || farm == null || farm.fieldPrefab == null) return;
+
+        ClearBlueprint();
+
+        buildingPrefab = farm.fieldPrefab;
+        currentBlueprintPrefab = farm.fieldPrefab;
+        blueprintSize = farm.fieldSize;
+
+        costGold = 0;
+        costWood = 0;
+        costStone = 0;
+
+        currentFarm = farm;
+
+        CreateBlueprint(currentBlueprintPrefab);
+        isPlacing = true;
+    }
+
+    private void CreateBlueprint(GameObject prefab)
+    {
         blueprintRoot = new GameObject("BlueprintRoot");
-        blueprintRoot.transform.position = Vector3.zero;
-        blueprintRoot.transform.rotation = Quaternion.identity;
 
-        blueprintModel = Instantiate(building.prefab, blueprintRoot.transform);
+        blueprintModel = Instantiate(prefab, blueprintRoot.transform);
+        blueprintModel.transform.localPosition = Vector3.zero;
         blueprintModel.transform.localRotation = Quaternion.identity;
         blueprintModel.transform.localScale = Vector3.one;
 
-        Collider col = blueprintModel.GetComponent<Collider>();
-        if (col != null) Destroy(col);
-
-        foreach (var script in blueprintModel.GetComponentsInChildren<MonoBehaviour>())
-            script.enabled = false;
+        RemoveCollidersAndScripts(blueprintModel);
 
         blueprintRenderers = blueprintModel.GetComponentsInChildren<Renderer>();
         mpb = new MaterialPropertyBlock();
 
-        float prefabLocalBottom = GetPrefabLocalBottom(blueprintModel);
-        blueprintModel.transform.localPosition = new Vector3(0f, -prefabLocalBottom, 0f);
-
-        isPlacing = true;
+        float bottom = GetPrefabLocalBottom(blueprintModel);
+        blueprintModel.transform.localPosition = new Vector3(0, -bottom, 0);
     }
+
+    private void RemoveCollidersAndScripts(GameObject obj)
+    {
+        foreach (var c in obj.GetComponentsInChildren<Collider>())
+            Destroy(c);
+
+        foreach (var s in obj.GetComponentsInChildren<MonoBehaviour>())
+            s.enabled = false;
+    }
+
+    // ----------------------------------------------------------
+    // UPDATE LOOP
+    // ----------------------------------------------------------
 
     private void Update()
     {
         if (!isPlacing) return;
+        if (Mouse.current == null) return;
 
         MoveBlueprint();
 
         if (Mouse.current.leftButton.wasPressedThisFrame)
             TryPlaceBuilding();
 
-        if (Mouse.current.rightButton.wasPressedThisFrame || Keyboard.current.escapeKey.wasPressedThisFrame)
+        if (Mouse.current.rightButton.wasPressedThisFrame ||
+            Keyboard.current.escapeKey.wasPressedThisFrame)
             CancelPlacing();
 
         if (Keyboard.current.rKey.wasPressedThisFrame)
@@ -82,79 +139,157 @@ public class BuildingPlacer : MonoBehaviour
 
     private void MoveBlueprint()
     {
-        if (blueprintRoot == null || tileGrid == null) return;
+        Vector2 mp = Mouse.current.position.ReadValue();
+        Ray ray = cam.ScreenPointToRay(mp);
 
-        Ray ray = cam.ScreenPointToRay(Mouse.current.position.ReadValue());
-        if (!Physics.Raycast(ray, out RaycastHit hit, 200f, tileLayer)) return;
+        if (!Physics.Raycast(ray, out RaycastHit hit, 200f, tileLayer))
+            return;
 
         Tile tile = hit.collider.GetComponent<Tile>();
         if (tile == null) return;
 
-        bool free = IsAreaFree(tile.gridPosition);
-        bool hasResources = resourceManager.CanAfford(costGold, costWood, costStone);
+        bool free = IsBlueprintAreaFree(tile.gridPosition);
+        bool resources = resourceManager.CanAfford(costGold, costWood, costStone);
 
-        float centerOffsetX = (buildingSize.x - 1) * 0.5f;
-        float centerOffsetZ = (buildingSize.y - 1) * 0.5f;
+        float offsetX = (blueprintSize.x - 1) * 0.5f;
+        float offsetZ = (blueprintSize.y - 1) * 0.5f;
 
-        float tileTopY = GetTileTop(tile);
+        float tileTop = GetTileTop(tile);
+
         blueprintRoot.transform.position = new Vector3(
-            tile.transform.position.x + centerOffsetX,
-            tileTopY,
-            tile.transform.position.z + centerOffsetZ
+            tile.transform.position.x + offsetX,
+            tileTop,
+            tile.transform.position.z + offsetZ
         );
 
-        PulseBlueprint(free, hasResources);
+        PulseBlueprint(free, resources);
     }
 
     private void PulseBlueprint(bool canBuild, bool hasResources)
     {
-        if (blueprintRoot == null || blueprintRenderers == null) return;
+        float puls = 1f + Mathf.Sin(Time.time * pulseSpeed) * pulseAmount;
+        blueprintRoot.transform.localScale = new Vector3(puls, 1f, puls);
 
-        float scaleXZ = 1f + Mathf.Sin(Time.time * pulseSpeed) * pulseAmount;
-        blueprintRoot.transform.localScale = new Vector3(scaleXZ, 1f, scaleXZ);
+        Color baseC = !canBuild ? Color.red :
+                      (!hasResources ? Color.yellow : Color.green);
 
-        Color baseColor = !canBuild ? Color.red : (!hasResources ? Color.yellow : Color.green);
-        float alphaPulse = 0.3f + 0.2f * Mathf.Sin(Time.time * pulseSpeed);
-        Color pulseColor = new Color(baseColor.r, baseColor.g, baseColor.b, alphaPulse);
+        float alpha = 0.3f + 0.2f * Mathf.Sin(Time.time * pulseSpeed);
 
-        foreach (Renderer r in blueprintRenderers)
+        Color c = new Color(baseC.r, baseC.g, baseC.b, alpha);
+
+        foreach (var r in blueprintRenderers)
         {
             r.GetPropertyBlock(mpb);
-            mpb.SetColor("_Color", pulseColor);
+            mpb.SetColor("_Color", c);
             r.SetPropertyBlock(mpb);
         }
     }
 
-    public bool IsAreaFree(Vector2Int startPos)
+    // ----------------------------------------------------------
+    // AREA CHECKS (FIELDS INCLUDE DIAGONALS)
+    // ----------------------------------------------------------
+
+    public bool IsAreaFree(Vector2Int start, Vector2Int size)
     {
-        for (int x = 0; x < buildingSize.x; x++)
-            for (int y = 0; y < buildingSize.y; y++)
+        for (int x = 0; x < size.x; x++)
+        {
+            for (int y = 0; y < size.y; y++)
+            {
+                int gx = start.x + x;
+                int gy = start.y + y;
+
+                if (gx < 0 || gy < 0 || gx >= tileGrid.GetLength(0) || gy >= tileGrid.GetLength(1))
+                    return false;
+
+                Tile t = tileGrid[gx, gy];
+
+                if (t.isOccupied || t.type != TileType.Grass)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    public bool IsBlueprintAreaFree(Vector2Int startPos)
+    {
+        bool isField = buildingPrefab.GetComponent<Field>() != null;
+
+        if (!IsAreaFree(startPos, blueprintSize))
+            return false;
+
+        // field must touch farm (diagonals included)
+        if (isField && currentFarm != null)
+        {
+            if (!CheckFarmAdjacency(startPos))
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool CheckFarmAdjacency(Vector2Int startPos)
+    {
+        Vector2Int[] offsets =
+        {
+            new Vector2Int( 1, 0), new Vector2Int(-1, 0),
+            new Vector2Int( 0, 1), new Vector2Int( 0,-1),
+            new Vector2Int( 1, 1), new Vector2Int(-1, 1),
+            new Vector2Int( 1,-1), new Vector2Int(-1,-1)
+        };
+
+        for (int x = 0; x < blueprintSize.x; x++)
+        {
+            for (int y = 0; y < blueprintSize.y; y++)
             {
                 int gx = startPos.x + x;
                 int gy = startPos.y + y;
 
-                if (gx < 0 || gx >= tileGrid.GetLength(0) || gy < 0 || gy >= tileGrid.GetLength(1))
-                    return false;
+                foreach (var off in offsets)
+                {
+                    int nx = gx + off.x;
+                    int ny = gy + off.y;
 
-                Tile t = tileGrid[gx, gy];
-                if (t.type != TileType.Grass || t.isOccupied) return false;
+                    if (nx < 0 || ny < 0 || nx >= tileGrid.GetLength(0) || ny >= tileGrid.GetLength(1))
+                        continue;
+
+                    Tile n = tileGrid[nx, ny];
+                    FarmTileMarker mark = n.GetComponent<FarmTileMarker>();
+
+                    if (mark != null && mark.farm == currentFarm)
+                        return true;
+                }
             }
-        return true;
+        }
+
+        return false;
     }
+
+    // ----------------------------------------------------------
+    // PLACEMENT
+    // ----------------------------------------------------------
 
     private void TryPlaceBuilding()
     {
-        Ray ray = cam.ScreenPointToRay(Mouse.current.position.ReadValue());
-        if (!Physics.Raycast(ray, out RaycastHit hit, 200f, tileLayer)) return;
+        Vector2 mp = Mouse.current.position.ReadValue();
+        Ray ray = cam.ScreenPointToRay(mp);
+
+        if (!Physics.Raycast(ray, out RaycastHit hit, 200f, tileLayer))
+            return;
 
         Tile tile = hit.collider.GetComponent<Tile>();
         if (tile == null) return;
 
-        if (!IsAreaFree(tile.gridPosition)) return;
-        if (!resourceManager.SpendResources(costGold, costWood, costStone))
-        {
-            Debug.Log("Nie masz wystarczających surowców!");
+        if (!IsBlueprintAreaFree(tile.gridPosition))
             return;
+
+        bool isFarm = buildingPrefab.GetComponent<Farm>() != null;
+        bool isField = buildingPrefab.GetComponent<Field>() != null;
+
+        if (!isFarm && !isField)
+        {
+            if (!resourceManager.SpendResources(costGold, costWood, costStone))
+                return;
         }
 
         PlaceBuilding(tile.gridPosition);
@@ -163,72 +298,87 @@ public class BuildingPlacer : MonoBehaviour
     private void PlaceBuilding(Vector2Int startPos)
     {
         Tile baseTile = tileGrid[startPos.x, startPos.y];
-        float tileTopY = GetTileTop(baseTile);
-        float prefabLocalBottom = GetPrefabLocalBottom(buildingPrefab);
+        float tileTop = GetTileTop(baseTile);
+        float bottom = GetPrefabLocalBottom(buildingPrefab);
 
-        Vector3 placedPos = new Vector3(
-            baseTile.transform.position.x + (buildingSize.x - 1) * 0.5f,
-            tileTopY - prefabLocalBottom,
-            baseTile.transform.position.z + (buildingSize.y - 1) * 0.5f
+        Vector3 pos = new Vector3(
+            baseTile.transform.position.x + (blueprintSize.x - 1) * 0.5f,
+            tileTop - bottom,
+            baseTile.transform.position.z + (blueprintSize.y - 1) * 0.5f
         );
 
-        Instantiate(buildingPrefab, placedPos, blueprintRoot.transform.rotation);
+        GameObject inst = Instantiate(buildingPrefab, pos, blueprintRoot.transform.rotation);
 
-        for (int x = 0; x < buildingSize.x; x++)
-            for (int y = 0; y < buildingSize.y; y++)
-                tileGrid[startPos.x + x, startPos.y + y].isOccupied = true;
+        for (int x = 0; x < blueprintSize.x; x++)
+        {
+            for (int y = 0; y < blueprintSize.y; y++)
+            {
+                Tile t = tileGrid[startPos.x + x, startPos.y + y];
+                t.isOccupied = true;
+
+                var farm = inst.GetComponent<Farm>();
+                if (farm != null)
+                {
+                    FarmTileMarker mark = t.gameObject.AddComponent<FarmTileMarker>();
+                    mark.farm = farm;
+                }
+            }
+        }
 
         ClearBlueprint();
     }
 
+    // ----------------------------------------------------------
+    // UTILS
+    // ----------------------------------------------------------
+
     private float GetTileTop(Tile tile)
     {
-        BoxCollider col = tile.GetComponentInChildren<BoxCollider>();
-        return col != null ? col.bounds.max.y : tile.transform.position.y;
+        var col = tile.GetComponentInChildren<Collider>();
+        if (col != null) return col.bounds.max.y;
+        return tile.transform.position.y;
     }
 
     private float GetPrefabLocalBottom(GameObject prefab)
     {
         Collider col = prefab.GetComponent<Collider>();
-        if (col == null) return 0f;
+        if (col == null) return 0;
 
-        if (col is BoxCollider box) return box.center.y - box.size.y * 0.5f;
-        if (col is CapsuleCollider capsule) return capsule.center.y - capsule.height * 0.5f;
-        if (col is SphereCollider sphere) return sphere.center.y - sphere.radius;
-        if (col is MeshCollider mesh)
-        {
-            Vector3 worldBottom = mesh.bounds.min;
-            return prefab.transform.InverseTransformPoint(worldBottom).y;
-        }
+        if (col is BoxCollider b) return b.center.y - b.size.y * 0.5f;
+        if (col is CapsuleCollider c) return c.center.y - c.height * 0.5f;
+        if (col is SphereCollider s) return s.center.y - s.radius;
+        if (col is MeshCollider m)
+            return prefab.transform.InverseTransformPoint(m.bounds.min).y;
 
-        return 0f;
+        return 0;
     }
 
     private void RotateBlueprint()
     {
         if (blueprintRoot == null) return;
+
         blueprintRoot.transform.Rotate(Vector3.up, 90f);
-        buildingSize = new Vector2Int(buildingSize.y, buildingSize.x);
+
+        blueprintSize = new Vector2Int(blueprintSize.y, blueprintSize.x);
     }
 
-    private void CancelPlacing() => ClearBlueprint();
+    private void CancelPlacing()
+    {
+        ClearBlueprint();
+    }
 
     private void ClearBlueprint()
     {
-        if (blueprintRoot != null) Destroy(blueprintRoot);
+        if (blueprintRoot != null)
+            Destroy(blueprintRoot);
+
         blueprintRoot = null;
         blueprintModel = null;
+        currentBlueprintPrefab = null;
+
         blueprintRenderers = null;
+
         isPlacing = false;
-    }
-
-    public Vector2Int GetBlueprintSize() => buildingSize;
-
-    public bool CanBuildAtTile(Vector2Int pos)
-    {
-        if (tileGrid == null) return false;
-        if (pos.x < 0 || pos.x >= tileGrid.GetLength(0) || pos.y < 0 || pos.y >= tileGrid.GetLength(1)) return false;   
-        Tile t = tileGrid[pos.x, pos.y];
-        return t.type == TileType.Grass && !t.isOccupied;
+        currentFarm = null;
     }
 }
